@@ -6,22 +6,29 @@ use std::{
         fd::{FromRawFd, RawFd},
         unix::net::UnixStream,
     },
+    sync::{LazyLock, Mutex},
 };
 
 use cosmic::{
     cctk::{
         self,
         cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1,
+        cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
         sctk::{
             self,
             output::{OutputHandler, OutputState},
             reexports::{calloop, calloop_wayland_source::WaylandSource},
             registry::{ProvidesRegistryState, RegistryState},
+            seat::{SeatHandler, SeatState},
         },
         toplevel_info::{ToplevelInfo, ToplevelInfoHandler, ToplevelInfoState},
+        toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
         wayland_client::{
-            Connection, QueueHandle, globals::registry_queue_init, protocol::wl_output::WlOutput,
+            Connection, QueueHandle, WEnum,
+            globals::registry_queue_init,
+            protocol::{wl_output::WlOutput, wl_seat::WlSeat},
         },
+        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
         wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1,
         workspace::{WorkspaceHandler, WorkspaceState},
     },
@@ -30,12 +37,21 @@ use cosmic::{
 use futures::{SinkExt, channel::mpsc, executor::block_on};
 use iced_futures::stream;
 
+static WAYLAND_REQUEST_TX: LazyLock<Mutex<Option<calloop::channel::Sender<WaylandRequest>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceWindow {
+    pub handle: ExtForeignToplevelHandleV1,
     pub title: String,
     pub app_id: Option<String>,
     pub identifier: Option<String>,
     pub is_active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum WaylandRequest {
+    Activate(ExtForeignToplevelHandleV1),
 }
 
 #[derive(Debug, Clone)]
@@ -44,13 +60,29 @@ pub enum WaylandUpdate {
     Finished,
 }
 
+pub fn focus_window(handle: ExtForeignToplevelHandleV1) {
+    let sender = WAYLAND_REQUEST_TX
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+
+    if let Some(sender) = sender {
+        let _ = sender.send(WaylandRequest::Activate(handle));
+    }
+}
+
 pub fn workspace_windows_subscription() -> Subscription<WaylandUpdate> {
     Subscription::run_with(std::any::TypeId::of::<WaylandUpdate>(), |_| {
+        let (request_tx, request_rx) = calloop::channel::channel();
+        if let Ok(mut guard) = WAYLAND_REQUEST_TX.lock() {
+            *guard = Some(request_tx);
+        }
+
         stream::channel(1, move |output: mpsc::Sender<WaylandUpdate>| async move {
             let _ = std::thread::Builder::new()
                 .name("workspace-window-list-wayland".into())
                 .spawn(move || {
-                    wayland_event_loop(output.clone());
+                    wayland_event_loop(output.clone(), request_rx);
                 });
 
             futures::future::pending::<()>().await;
@@ -71,6 +103,8 @@ struct AppData {
     output_state: OutputState,
     workspace_state: WorkspaceState,
     toplevel_info_state: ToplevelInfoState,
+    toplevel_manager_state: Option<ToplevelManagerState>,
+    seat_state: SeatState,
     configured_output: Option<String>,
     expected_output: Option<WlOutput>,
     workspaces_ready: bool,
@@ -89,6 +123,7 @@ impl AppData {
         let identifier = Self::trimmed(&info.identifier);
 
         Some(WorkspaceWindow {
+            handle: info.foreign_toplevel.clone(),
             title,
             app_id,
             identifier,
@@ -96,6 +131,30 @@ impl AppData {
                 .state
                 .contains(&zcosmic_toplevel_handle_v1::State::Activated),
         })
+    }
+
+    fn cosmic_toplevel(
+        &self,
+        handle: &ExtForeignToplevelHandleV1,
+    ) -> Option<cctk::cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1>{
+        self.toplevel_info_state
+            .info(handle)?
+            .cosmic_toplevel
+            .clone()
+    }
+
+    fn activate_toplevel(&self, handle: &ExtForeignToplevelHandleV1) {
+        let Some(manager_state) = self.toplevel_manager_state.as_ref() else {
+            return;
+        };
+        let Some(cosmic_toplevel) = self.cosmic_toplevel(handle) else {
+            return;
+        };
+        let Some(seat) = self.seat_state.seats().next() else {
+            return;
+        };
+
+        manager_state.manager.activate(&cosmic_toplevel, &seat);
     }
 
     fn output_scope(&self) -> OutputScope<'_> {
@@ -274,6 +333,52 @@ impl WorkspaceHandler for AppData {
     }
 }
 
+impl SeatHandler for AppData {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: WlSeat,
+        _capability: sctk::seat::Capability,
+    ) {
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: WlSeat,
+        _capability: sctk::seat::Capability,
+    ) {
+    }
+
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {}
+}
+
+impl ToplevelManagerHandler for AppData {
+    fn toplevel_manager_state(&mut self) -> &mut ToplevelManagerState {
+        self.toplevel_manager_state
+            .as_mut()
+            .expect("toplevel manager not initialized")
+    }
+
+    fn capabilities(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _capabilities: Vec<
+            WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>,
+        >,
+    ) {
+    }
+}
+
 impl ToplevelInfoHandler for AppData {
     fn toplevel_info_state(&mut self) -> &mut ToplevelInfoState {
         &mut self.toplevel_info_state
@@ -311,7 +416,10 @@ impl ToplevelInfoHandler for AppData {
     }
 }
 
-fn wayland_event_loop(tx: mpsc::Sender<WaylandUpdate>) {
+fn wayland_event_loop(
+    tx: mpsc::Sender<WaylandUpdate>,
+    requests: calloop::channel::Channel<WaylandRequest>,
+) {
     let finished_tx = tx.clone();
 
     let socket = std::env::var("X_PRIVILEGED_WAYLAND_SOCKET")
@@ -364,6 +472,21 @@ fn wayland_event_loop(tx: mpsc::Sender<WaylandUpdate>) {
         return;
     }
 
+    if event_loop
+        .handle()
+        .insert_source(requests, |event, (), state| match event {
+            calloop::channel::Event::Msg(WaylandRequest::Activate(handle)) => {
+                state.activate_toplevel(&handle);
+            }
+            calloop::channel::Event::Closed => {}
+        })
+        .is_err()
+    {
+        tracing::error!("Failed to register the applet request channel");
+        let _ = block_on(finished_tx.clone().send(WaylandUpdate::Finished));
+        return;
+    }
+
     let registry_state = RegistryState::new(&globals);
     let output_state = OutputState::new(&globals, &qh);
     let workspace_state = WorkspaceState::new(&registry_state, &qh);
@@ -372,6 +495,7 @@ fn wayland_event_loop(tx: mpsc::Sender<WaylandUpdate>) {
         let _ = block_on(finished_tx.clone().send(WaylandUpdate::Finished));
         return;
     };
+    let toplevel_manager_state = ToplevelManagerState::try_new(&registry_state, &qh);
 
     let mut app_data = AppData {
         tx,
@@ -379,6 +503,8 @@ fn wayland_event_loop(tx: mpsc::Sender<WaylandUpdate>) {
         output_state,
         workspace_state,
         toplevel_info_state,
+        toplevel_manager_state,
+        seat_state: SeatState::new(&globals, &qh),
         configured_output: std::env::var("COSMIC_PANEL_OUTPUT")
             .ok()
             .filter(|value| !value.is_empty()),
@@ -397,7 +523,9 @@ fn wayland_event_loop(tx: mpsc::Sender<WaylandUpdate>) {
     let _ = block_on(finished_tx.clone().send(WaylandUpdate::Finished));
 }
 
+sctk::delegate_seat!(AppData);
 sctk::delegate_output!(AppData);
 sctk::delegate_registry!(AppData);
 cctk::delegate_workspace!(AppData);
 cctk::delegate_toplevel_info!(AppData);
+cctk::delegate_toplevel_manager!(AppData);

@@ -5,6 +5,7 @@ mod wayland;
 use std::sync::LazyLock;
 
 use cosmic::{
+    cctk::wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
     Element, app,
     applet::cosmic_panel_config::PanelAnchor,
     desktop::{
@@ -12,14 +13,14 @@ use cosmic::{
         resolve_desktop_entry,
     },
     iced::{
-        self, Alignment, Length, Subscription,
+        self, Alignment, Length, Subscription, mouse,
         widget::{row, space},
     },
     theme,
     widget::{self, autosize, container},
 };
 
-use wayland::{WaylandUpdate, WorkspaceWindow, workspace_windows_subscription};
+use wayland::{WaylandUpdate, WorkspaceWindow, focus_window, workspace_windows_subscription};
 
 const APP_ID: &str = "io.github.tkilian.CosmicAppletAppTitle";
 const HORIZONTAL_MAX_CHARS: usize = 24;
@@ -34,6 +35,7 @@ pub fn run() -> cosmic::iced::Result {
 
 #[derive(Clone)]
 struct DisplayWindow {
+    handle: ExtForeignToplevelHandleV1,
     title: String,
     icon: Option<widget::icon::Handle>,
     is_active: bool,
@@ -47,6 +49,7 @@ pub struct Applet {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    FocusWindow(ExtForeignToplevelHandleV1),
     Wayland(WaylandUpdate),
 }
 
@@ -75,25 +78,11 @@ impl Applet {
         Some(icon.as_cosmic_icon())
     }
 
-    fn display_windows(
-        &self,
-    ) -> impl Iterator<Item = (&str, Option<widget::icon::Handle>, bool)> + '_ {
-        self.windows
-            .iter()
-            .map(|window| (window.title.as_str(), window.icon.clone(), window.is_active))
-    }
-
-    fn window_chip(
-        &self,
-        title: &str,
-        icon: Option<widget::icon::Handle>,
-        is_active: bool,
-        icon_size: f32,
-    ) -> Element<'_, Message> {
-        let text = truncate_title(title, self.max_chars());
+    fn window_tile(&self, window: &DisplayWindow, icon_size: f32) -> Element<'_, Message> {
+        let text = truncate_title(&window.title, self.max_chars());
         let mut content = row![].align_y(Alignment::Center).spacing(4);
 
-        if let Some(icon) = icon {
+        if let Some(icon) = window.icon.clone() {
             content = content.push(
                 widget::icon(icon)
                     .width(Length::Fixed(icon_size))
@@ -103,21 +92,51 @@ impl Applet {
 
         content = content.push(self.core.applet.text(text));
 
-        container(content)
+        let is_active = window.is_active;
+        let handle = window.handle.clone();
+
+        widget::mouse_area(
+            container(content)
+                .padding([2, 8])
+                .class(theme::Container::custom(move |theme| {
+                    let cosmic = theme.cosmic();
+                    let (background, foreground) = if is_active {
+                        (
+                            cosmic.accent_button.base.into(),
+                            cosmic.accent_button.on.into(),
+                        )
+                    } else {
+                        (
+                            cosmic.background.component.base.into(),
+                            cosmic.background.component.on.into(),
+                        )
+                    };
+
+                    container::Style {
+                        icon_color: Some(foreground),
+                        text_color: Some(foreground),
+                        background: Some(iced::Background::Color(background)),
+                        border: iced::Border {
+                            radius: cosmic.corner_radii.radius_s.into(),
+                            ..Default::default()
+                        },
+                        shadow: Default::default(),
+                        snap: true,
+                    }
+                })),
+        )
+        .interaction(mouse::Interaction::Idle)
+        .on_press(Message::FocusWindow(handle))
+        .into()
+    }
+
+    fn empty_tile(&self) -> Element<'_, Message> {
+        container(self.core.applet.text(EMPTY_TITLE))
             .padding([2, 8])
             .class(theme::Container::custom(move |theme| {
                 let cosmic = theme.cosmic();
-                let (background, foreground) = if is_active {
-                    (
-                        cosmic.accent_button.base.into(),
-                        cosmic.accent_button.on.into(),
-                    )
-                } else {
-                    (
-                        cosmic.background.component.base.into(),
-                        cosmic.background.component.on.into(),
-                    )
-                };
+                let background = cosmic.background.component.base.into();
+                let foreground = cosmic.background.component.on.into();
 
                 container::Style {
                     icon_color: Some(foreground),
@@ -167,11 +186,15 @@ impl cosmic::Application for Applet {
 
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
         match message {
+            Message::FocusWindow(handle) => {
+                focus_window(handle);
+            }
             Message::Wayland(update) => match update {
                 WaylandUpdate::WorkspaceWindows(windows) => {
                     self.windows = windows
                         .into_iter()
                         .map(|window| DisplayWindow {
+                            handle: window.handle.clone(),
                             title: window.title.clone(),
                             icon: self.resolve_icon(&window),
                             is_active: window.is_active,
@@ -198,10 +221,10 @@ impl cosmic::Application for Applet {
         let mut content = row![].align_y(Alignment::Center).spacing(6);
 
         if self.windows.is_empty() {
-            content = content.push(self.window_chip(EMPTY_TITLE, None, false, icon_size));
+            content = content.push(self.empty_tile());
         } else {
-            for (title, icon, is_active) in self.display_windows() {
-                content = content.push(self.window_chip(title, icon, is_active, icon_size));
+            for window in &self.windows {
+                content = content.push(self.window_tile(window, icon_size));
             }
         }
 
