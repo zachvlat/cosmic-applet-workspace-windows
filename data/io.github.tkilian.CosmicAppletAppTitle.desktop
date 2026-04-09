@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=Active Window Title
+Comment=Show the active window title in the COSMIC panel
+Type=Application
+Exec=cosmic-applet-app-title
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Window;Title;
+Icon=io.github.tkilian.CosmicAppletAppTitle
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-HostWaylandDisplay=true
+X-OverflowPriority=75
+X-OverflowMinSize=8

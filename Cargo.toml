@@ -1,0 +1,15 @@
+[package]
+name = "cosmic-applet-app-title"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-only"
+description = "COSMIC panel applet that shows the active window title"
+
+[dependencies]
+futures = "0.3.31"
+iced_futures = { git = "https://github.com/pop-os/libcosmic", rev = "a44cff8011d81209e18de86f24da248c88b5a28d", package = "iced_futures" }
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "a44cff8011d81209e18de86f24da248c88b5a28d", default-features = false, features = ["applet", "desktop", "tokio", "wayland"] }
+tracing = "0.1.44"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
