@@ -14,6 +14,7 @@ use cosmic::{
         self,
         cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1,
         cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
+        cosmic_protocols::workspace::v2::client::zcosmic_workspace_handle_v2,
         sctk::{
             self,
             output::{OutputHandler, OutputState},
@@ -40,14 +41,24 @@ use iced_futures::stream;
 static WAYLAND_REQUEST_TX: LazyLock<Mutex<Option<calloop::channel::Sender<WaylandRequest>>>> =
     LazyLock::new(|| Mutex::new(None));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceWindow {
     pub handle: ExtForeignToplevelHandleV1,
     pub title: String,
     pub app_id: Option<String>,
     pub identifier: Option<String>,
+    pub geometry: Option<WindowGeometry>,
     pub is_active: bool,
     pub is_maximized: bool,
+    pub is_sticky: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +71,10 @@ pub enum WaylandRequest {
 
 #[derive(Debug, Clone)]
 pub enum WaylandUpdate {
-    WorkspaceWindows(Vec<WorkspaceWindow>),
+    WorkspaceWindows {
+        windows: Vec<WorkspaceWindow>,
+        tiling_enabled: bool,
+    },
     Finished,
 }
 
@@ -146,6 +160,7 @@ struct AppData {
     expected_output: Option<WlOutput>,
     workspaces_ready: bool,
     last_windows: Vec<WorkspaceWindow>,
+    last_tiling_enabled: bool,
 }
 
 impl AppData {
@@ -154,7 +169,26 @@ impl AppData {
         (!value.is_empty()).then(|| value.to_owned())
     }
 
-    fn window_for(info: &ToplevelInfo) -> Option<WorkspaceWindow> {
+    fn geometry_for(info: &ToplevelInfo, scope: &OutputScope<'_>) -> Option<WindowGeometry> {
+        let geometry = match scope {
+            OutputScope::Any => info.geometry.values().next(),
+            OutputScope::Pending => None,
+            OutputScope::Specific(output) => info
+                .geometry
+                .iter()
+                .find(|(candidate, _)| *candidate == *output)
+                .map(|(_, geometry)| geometry),
+        }?;
+
+        Some(WindowGeometry {
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
+        })
+    }
+
+    fn window_for(info: &ToplevelInfo, scope: &OutputScope<'_>) -> Option<WorkspaceWindow> {
         let app_id = Self::trimmed(&info.app_id);
         let title = Self::trimmed(&info.title).or_else(|| app_id.clone())?;
         let identifier = Self::trimmed(&info.identifier);
@@ -164,12 +198,16 @@ impl AppData {
             title,
             app_id,
             identifier,
+            geometry: Self::geometry_for(info, scope),
             is_active: info
                 .state
                 .contains(&zcosmic_toplevel_handle_v1::State::Activated),
             is_maximized: info
                 .state
                 .contains(&zcosmic_toplevel_handle_v1::State::Maximized),
+            is_sticky: info
+                .state
+                .contains(&zcosmic_toplevel_handle_v1::State::Sticky),
         })
     }
 
@@ -265,30 +303,55 @@ impl AppData {
             .any(|workspace| info.workspace.contains(workspace))
     }
 
-    fn current_windows(&self) -> Vec<WorkspaceWindow> {
+    fn workspace_tiling_enabled(
+        &self,
+        active_workspaces: &HashSet<ext_workspace_handle_v1::ExtWorkspaceHandleV1>,
+    ) -> bool {
+        active_workspaces
+            .iter()
+            .filter_map(|handle| self.workspace_state.workspace_info(handle))
+            .any(|workspace| {
+                matches!(
+                    workspace.tiling,
+                    Some(WEnum::Value(
+                        zcosmic_workspace_handle_v2::TilingState::TilingEnabled
+                    )) | Some(WEnum::Unknown(1))
+                )
+            })
+    }
+
+    fn current_windows(&self) -> (Vec<WorkspaceWindow>, bool) {
         let output_scope = self.output_scope();
         if matches!(output_scope, OutputScope::Pending) || !self.workspaces_ready {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         let active_workspaces = self.active_workspaces(&output_scope);
+        let tiling_enabled = self.workspace_tiling_enabled(&active_workspaces);
 
-        self.toplevel_info_state
+        let windows = self
+            .toplevel_info_state
             .toplevels()
             .filter(|info| Self::matches_output(info, &output_scope))
             .filter(|info| Self::matches_workspace(info, &active_workspaces))
-            .filter_map(Self::window_for)
-            .collect()
+            .filter_map(|info| Self::window_for(info, &output_scope))
+            .collect();
+
+        (windows, tiling_enabled)
     }
 
     fn publish_windows(&mut self) {
-        let windows = self.current_windows();
-        if windows == self.last_windows {
+        let (windows, tiling_enabled) = self.current_windows();
+        if windows == self.last_windows && tiling_enabled == self.last_tiling_enabled {
             return;
         }
 
         self.last_windows = windows.clone();
-        let _ = block_on(self.tx.send(WaylandUpdate::WorkspaceWindows(windows)));
+        self.last_tiling_enabled = tiling_enabled;
+        let _ = block_on(self.tx.send(WaylandUpdate::WorkspaceWindows {
+            windows,
+            tiling_enabled,
+        }));
     }
 
     fn sync_expected_output(&mut self, output: &WlOutput) -> bool {
@@ -576,6 +639,7 @@ fn wayland_event_loop(
         expected_output: None,
         workspaces_ready: false,
         last_windows: Vec::new(),
+        last_tiling_enabled: false,
     };
 
     loop {

@@ -3,18 +3,26 @@
 mod config;
 mod wayland;
 
-use std::sync::LazyLock;
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
 use config::{AppletConfig, MAX_TITLE_CHARS, MIN_TITLE_CHARS};
 use cosmic::{
-    cctk::wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
     Apply, Element, app,
+    cctk::{
+        wayland_client::Proxy,
+        wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    },
     desktop::{
         DesktopEntryCache, DesktopLookupContext, DesktopResolveOptions, IconSourceExt, fde,
         resolve_desktop_entry, spawn_desktop_exec,
     },
     iced::{
-        self, Alignment, Length, Subscription, event, mouse, widget::{row, space},
+        self, Alignment, Length, Subscription, event, mouse,
+        widget::{row, space},
         window,
     },
     surface::action::{app_popup, destroy_popup},
@@ -23,16 +31,22 @@ use cosmic::{
 };
 
 use wayland::{
-    WaylandUpdate, WorkspaceWindow, close_window, focus_window, minimize_window,
+    WaylandUpdate, WindowGeometry, WorkspaceWindow, close_window, focus_window, minimize_window,
     set_window_maximized, workspace_windows_subscription,
 };
 
 const APP_ID: &str = "io.github.tkilian.CosmicAppletAppTitle";
 const EMPTY_TITLE: &str = "Desktop";
 const CONTEXT_MENU_WIDTH: f32 = 320.0;
+const DRAG_THRESHOLD: f32 = 8.0;
+const EDGE_ALIGNMENT_TOLERANCE: i32 = 16;
+const FLOATING_OVERLAP_RATIO: f32 = 0.18;
+const FLOATING_SMALL_AREA_RATIO: f32 = 0.72;
 const SETTINGS_POPUP_WIDTH: f32 = 360.0;
 
 static AUTOSIZE_MAIN_ID: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("autosize-main"));
+
+type WindowId = u32;
 
 pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Applet>(())
@@ -46,15 +60,23 @@ struct WindowMenuAction {
     terminal: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackAxis {
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Clone)]
 struct DisplayWindow {
     app_name: String,
+    geometry: Option<WindowGeometry>,
     menu_actions: Vec<WindowMenuAction>,
     handle: ExtForeignToplevelHandleV1,
     title: String,
     icon: Option<widget::icon::Handle>,
     is_active: bool,
     is_maximized: bool,
+    is_sticky: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +93,11 @@ enum DeferredMenuAction {
     WindowControl(WindowControlAction),
 }
 
+struct PressedWindow {
+    handle: ExtForeignToplevelHandleV1,
+    origin: Option<iced::Point>,
+}
+
 struct Applet {
     config: AppletConfig,
     config_dirty: bool,
@@ -79,12 +106,17 @@ struct Applet {
     core: cosmic::app::Core,
     cursor_in_applet: Option<iced::Point>,
     desktop_cache: DesktopEntryCache,
+    dragging_window: Option<WindowId>,
     hovered_window: Option<ExtForeignToplevelHandleV1>,
+    last_drag_target: Option<WindowId>,
+    ordered_window_ids: Vec<WindowId>,
     pending_context_menu_window: Option<ExtForeignToplevelHandleV1>,
     pending_menu_action: Option<DeferredMenuAction>,
+    pressed_window: Option<PressedWindow>,
     settings_popup: Option<window::Id>,
     source_windows: Vec<WorkspaceWindow>,
     windows: Vec<DisplayWindow>,
+    workspace_tiling_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,12 +125,13 @@ enum Message {
     ClearHoveredWindowGlobal,
     CloseWindow(ExtForeignToplevelHandleV1),
     DesktopActionFinished,
-    FocusWindow(ExtForeignToplevelHandleV1),
     HoverWindow(ExtForeignToplevelHandleV1),
     MinimizeWindow(ExtForeignToplevelHandleV1),
     OpenWindowContextMenu(ExtForeignToplevelHandleV1),
     OpenSettingsPopup,
     PopupClosed(window::Id),
+    PressWindow(ExtForeignToplevelHandleV1),
+    ReleasePointer,
     RunWindowAction(WindowMenuAction),
     SetMaxTitleChars(usize),
     SetMiddleClickCloses(bool),
@@ -109,6 +142,10 @@ enum Message {
 }
 
 impl Applet {
+    fn window_id(handle: &ExtForeignToplevelHandleV1) -> WindowId {
+        handle.id().protocol_id()
+    }
+
     fn persist_config_if_dirty(&mut self) {
         if self.config_dirty {
             self.config.save();
@@ -194,12 +231,14 @@ impl Applet {
 
         DisplayWindow {
             app_name,
+            geometry: window.geometry,
             menu_actions,
             handle: window.handle.clone(),
             title: window.title.clone(),
             icon,
             is_active: window.is_active,
             is_maximized: window.is_maximized,
+            is_sticky: window.is_sticky,
         }
     }
 
@@ -297,12 +336,360 @@ impl Applet {
         .into()
     }
 
+    fn apply_window_order(&mut self) {
+        let order = self
+            .layout_window_order()
+            .unwrap_or_else(|| self.ordered_window_ids.clone());
+        let positions = order
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect::<HashMap<_, _>>();
+
+        self.windows.sort_by_key(|window| {
+            positions
+                .get(&Self::window_id(&window.handle))
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    fn manual_window_order_index(&self, handle: &ExtForeignToplevelHandleV1) -> usize {
+        let window_id = Self::window_id(handle);
+        self.ordered_window_ids
+            .iter()
+            .position(|id| *id == window_id)
+            .unwrap_or(usize::MAX)
+    }
+
+    fn window_area(geometry: WindowGeometry) -> i64 {
+        i64::from(geometry.width.max(0)) * i64::from(geometry.height.max(0))
+    }
+
+    fn window_right(geometry: WindowGeometry) -> i32 {
+        geometry.x.saturating_add(geometry.width)
+    }
+
+    fn window_bottom(geometry: WindowGeometry) -> i32 {
+        geometry.y.saturating_add(geometry.height)
+    }
+
+    fn overlap_area(left: WindowGeometry, right: WindowGeometry) -> i64 {
+        let x_overlap =
+            (Self::window_right(left).min(Self::window_right(right)) - left.x.max(right.x)).max(0);
+        let y_overlap = (Self::window_bottom(left).min(Self::window_bottom(right))
+            - left.y.max(right.y))
+        .max(0);
+
+        i64::from(x_overlap) * i64::from(y_overlap)
+    }
+
+    fn windows_align(left: WindowGeometry, right: WindowGeometry) -> bool {
+        let tolerance = EDGE_ALIGNMENT_TOLERANCE as u32;
+
+        left.x.abs_diff(right.x) <= tolerance
+            || left.y.abs_diff(right.y) <= tolerance
+            || Self::window_right(left).abs_diff(Self::window_right(right)) <= tolerance
+            || Self::window_bottom(left).abs_diff(Self::window_bottom(right)) <= tolerance
+    }
+
+    fn floating_window_ids(&self, windows: &[&DisplayWindow]) -> HashSet<WindowId> {
+        let largest_area = windows
+            .iter()
+            .filter_map(|window| window.geometry)
+            .map(Self::window_area)
+            .max()
+            .unwrap_or(0);
+
+        windows
+            .iter()
+            .filter_map(|window| {
+                let window_id = Self::window_id(&window.handle);
+                let geometry = match window.geometry {
+                    Some(geometry) => geometry,
+                    None => return Some(window_id),
+                };
+
+                if window.is_sticky {
+                    return Some(window_id);
+                }
+
+                let area = Self::window_area(geometry);
+                let has_large_overlap = windows.iter().any(|other| {
+                    if window.handle == other.handle {
+                        return false;
+                    }
+
+                    let Some(other_geometry) = other.geometry else {
+                        return false;
+                    };
+                    let other_area = Self::window_area(other_geometry);
+                    if other_area < area {
+                        return false;
+                    }
+
+                    let overlap = Self::overlap_area(geometry, other_geometry);
+                    overlap > 0 && (overlap as f32 / area.max(1) as f32) >= FLOATING_OVERLAP_RATIO
+                });
+
+                let shares_edge = windows.iter().any(|other| {
+                    if window.handle == other.handle {
+                        return false;
+                    }
+
+                    other
+                        .geometry
+                        .is_some_and(|other_geometry| Self::windows_align(geometry, other_geometry))
+                });
+
+                let is_small = largest_area > 0
+                    && (area as f32) <= (largest_area as f32 * FLOATING_SMALL_AREA_RATIO);
+
+                (has_large_overlap || (is_small && !shares_edge)).then_some(window_id)
+            })
+            .collect()
+    }
+
+    fn tiled_master_id(windows: &[&DisplayWindow]) -> Option<WindowId> {
+        windows
+            .iter()
+            .filter_map(|window| {
+                window.geometry.map(|geometry| {
+                    (
+                        window,
+                        (
+                            Reverse(Self::window_area(geometry)),
+                            geometry.x,
+                            geometry.y,
+                            Reverse(Self::window_id(&window.handle)),
+                        ),
+                    )
+                })
+            })
+            .min_by_key(|(_, key)| *key)
+            .map(|(window, _)| Self::window_id(&window.handle))
+    }
+
+    fn tiled_stack_axis(windows: &[&DisplayWindow], master_id: Option<WindowId>) -> StackAxis {
+        let geometries = windows
+            .iter()
+            .filter(|window| Some(Self::window_id(&window.handle)) != master_id)
+            .filter_map(|window| window.geometry)
+            .collect::<Vec<_>>();
+
+        let Some(first) = geometries.first().copied() else {
+            return StackAxis::Vertical;
+        };
+
+        let (mut min_x, mut max_x) = (first.x, first.x);
+        let (mut min_y, mut max_y) = (first.y, first.y);
+        for geometry in geometries.iter().copied().skip(1) {
+            min_x = min_x.min(geometry.x);
+            max_x = max_x.max(geometry.x);
+            min_y = min_y.min(geometry.y);
+            max_y = max_y.max(geometry.y);
+        }
+
+        if max_y.abs_diff(min_y) >= max_x.abs_diff(min_x) {
+            StackAxis::Vertical
+        } else {
+            StackAxis::Horizontal
+        }
+    }
+
+    fn compare_floating_windows(&self, left: &DisplayWindow, right: &DisplayWindow) -> Ordering {
+        self.manual_window_order_index(&left.handle)
+            .cmp(&self.manual_window_order_index(&right.handle))
+            .then_with(|| match (left.geometry, right.geometry) {
+                (Some(left_geometry), Some(right_geometry)) => left_geometry
+                    .y
+                    .cmp(&right_geometry.y)
+                    .then_with(|| left_geometry.x.cmp(&right_geometry.x)),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+            .then_with(|| left.title.cmp(&right.title))
+    }
+
+    fn compare_tiled_windows(
+        &self,
+        left: &DisplayWindow,
+        right: &DisplayWindow,
+        master_id: Option<WindowId>,
+        stack_axis: StackAxis,
+    ) -> Ordering {
+        let left_id = Self::window_id(&left.handle);
+        let right_id = Self::window_id(&right.handle);
+
+        match (Some(left_id) == master_id, Some(right_id) == master_id) {
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            _ => {}
+        }
+
+        match (left.geometry, right.geometry) {
+            (Some(left_geometry), Some(right_geometry)) => {
+                let geometry_order = match stack_axis {
+                    StackAxis::Horizontal => left_geometry
+                        .x
+                        .cmp(&right_geometry.x)
+                        .then_with(|| left_geometry.y.cmp(&right_geometry.y)),
+                    StackAxis::Vertical => left_geometry
+                        .y
+                        .cmp(&right_geometry.y)
+                        .then_with(|| left_geometry.x.cmp(&right_geometry.x)),
+                };
+
+                if geometry_order != Ordering::Equal {
+                    return geometry_order;
+                }
+            }
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            (None, None) => {}
+        }
+
+        self.manual_window_order_index(&left.handle)
+            .cmp(&self.manual_window_order_index(&right.handle))
+            .then_with(|| left.title.cmp(&right.title))
+    }
+
+    fn layout_window_order(&self) -> Option<Vec<WindowId>> {
+        if !self.workspace_tiling_enabled {
+            return None;
+        }
+
+        let windows = self.windows.iter().collect::<Vec<_>>();
+        if windows.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let floating_ids = self.floating_window_ids(&windows);
+        let mut tiled_windows = windows
+            .iter()
+            .copied()
+            .filter(|window| !floating_ids.contains(&Self::window_id(&window.handle)))
+            .collect::<Vec<_>>();
+        let mut floating_windows = windows
+            .iter()
+            .copied()
+            .filter(|window| floating_ids.contains(&Self::window_id(&window.handle)))
+            .collect::<Vec<_>>();
+
+        let master_id = Self::tiled_master_id(&tiled_windows);
+        let stack_axis = Self::tiled_stack_axis(&tiled_windows, master_id);
+
+        tiled_windows
+            .sort_by(|left, right| self.compare_tiled_windows(left, right, master_id, stack_axis));
+        floating_windows.sort_by(|left, right| self.compare_floating_windows(left, right));
+
+        Some(
+            tiled_windows
+                .into_iter()
+                .chain(floating_windows)
+                .map(|window| Self::window_id(&window.handle))
+                .collect(),
+        )
+    }
+
+    fn clear_pointer_state(&mut self) {
+        self.dragging_window = None;
+        self.last_drag_target = None;
+        self.pressed_window = None;
+    }
+
+    fn reorder_window(&mut self, dragged_id: WindowId, target_id: WindowId) -> bool {
+        if dragged_id == target_id {
+            return false;
+        }
+
+        let Some(from) = self
+            .ordered_window_ids
+            .iter()
+            .position(|id| *id == dragged_id)
+        else {
+            return false;
+        };
+        let Some(target_position) = self
+            .ordered_window_ids
+            .iter()
+            .position(|id| *id == target_id)
+        else {
+            return false;
+        };
+
+        let dragged = self.ordered_window_ids.remove(from);
+        let Some(target_after_removal) = self
+            .ordered_window_ids
+            .iter()
+            .position(|id| *id == target_id)
+        else {
+            self.ordered_window_ids.insert(from, dragged);
+            return false;
+        };
+
+        let insert_at = if from < target_position {
+            target_after_removal + 1
+        } else {
+            target_after_removal
+        };
+
+        self.ordered_window_ids
+            .insert(insert_at.min(self.ordered_window_ids.len()), dragged);
+        self.apply_window_order();
+        true
+    }
+
+    fn sync_window_order(&mut self) {
+        let live_ids = self
+            .windows
+            .iter()
+            .map(|window| Self::window_id(&window.handle))
+            .collect::<Vec<_>>();
+
+        self.ordered_window_ids
+            .retain(|id| live_ids.iter().any(|live_id| live_id == id));
+
+        for live_id in &live_ids {
+            if !self.ordered_window_ids.contains(live_id) {
+                self.ordered_window_ids.push(*live_id);
+            }
+        }
+
+        self.apply_window_order();
+
+        if self
+            .dragging_window
+            .is_some_and(|id| !live_ids.iter().any(|live_id| *live_id == id))
+        {
+            self.dragging_window = None;
+            self.last_drag_target = None;
+        }
+
+        if self
+            .last_drag_target
+            .is_some_and(|id| !live_ids.iter().any(|live_id| *live_id == id))
+        {
+            self.last_drag_target = None;
+        }
+
+        if self.pressed_window.as_ref().is_some_and(|pressed| {
+            !live_ids
+                .iter()
+                .any(|live_id| *live_id == Self::window_id(&pressed.handle))
+        }) {
+            self.pressed_window = None;
+        }
+    }
+
     fn rebuild_windows(&mut self) {
         let source_windows = self.source_windows.clone();
         self.windows = source_windows
             .iter()
             .map(|window| self.resolve_window(window))
             .collect();
+        self.sync_window_order();
 
         if self
             .hovered_window
@@ -326,6 +713,15 @@ impl Applet {
             .is_some_and(|target| !self.windows.iter().any(|window| &window.handle == target))
         {
             self.pending_context_menu_window = None;
+        }
+
+        if self.pressed_window.as_ref().is_some_and(|pressed| {
+            !self
+                .windows
+                .iter()
+                .any(|window| window.handle == pressed.handle)
+        }) {
+            self.pressed_window = None;
         }
     }
 
@@ -567,11 +963,15 @@ impl Applet {
         content = content.push(self.core.applet.text(text));
 
         let is_active = window.is_active;
+        let is_dragging = self
+            .dragging_window
+            .is_some_and(|dragging| dragging == Self::window_id(&window.handle));
         let is_hovered = self
             .hovered_window
             .as_ref()
             .is_some_and(|hovered| hovered == &window.handle);
         let handle = window.handle.clone();
+        let press_handle = handle.clone();
         let hover_handle = handle.clone();
         let hover_move_handle = handle.clone();
         let context_handle = handle.clone();
@@ -579,35 +979,40 @@ impl Applet {
             .padding([2, 8])
             .class(theme::Container::custom(move |theme| {
                 let cosmic = theme.cosmic();
+                let highlight = is_hovered || is_dragging;
                 let (background, foreground, border_color, border_width) = if is_active {
                     (
-                        if is_hovered {
+                        if highlight {
                             cosmic.accent_button.hover.into()
                         } else {
                             cosmic.accent_button.base.into()
                         },
                         cosmic.accent_button.on.into(),
-                        if is_hovered {
+                        if is_dragging {
+                            cosmic.accent.base.into()
+                        } else if is_hovered {
                             cosmic.accent.base.into()
                         } else {
                             iced::Color::TRANSPARENT
                         },
-                        if is_hovered { 1.0 } else { 0.0 },
+                        if highlight { 1.0 } else { 0.0 },
                     )
                 } else {
                     (
-                        if is_hovered {
+                        if highlight {
                             cosmic.background.component.hover.into()
                         } else {
                             cosmic.background.component.base.into()
                         },
                         cosmic.background.component.on.into(),
-                        if is_hovered {
+                        if is_dragging {
+                            cosmic.accent.base.into()
+                        } else if is_hovered {
                             cosmic.bg_divider().into()
                         } else {
                             iced::Color::TRANSPARENT
                         },
-                        if is_hovered { 1.0 } else { 0.0 },
+                        if highlight { 1.0 } else { 0.0 },
                     )
                 };
 
@@ -631,7 +1036,7 @@ impl Applet {
             .on_enter(Message::HoverWindow(hover_handle))
             .on_move(move |_| Message::HoverWindow(hover_move_handle.clone()))
             .on_exit(Message::ClearHoveredWindow(handle.clone()))
-            .on_press(Message::FocusWindow(handle.clone()))
+            .on_press(Message::PressWindow(press_handle))
             .on_right_press(Message::OpenWindowContextMenu(context_handle));
 
         let tile = if self.config.middle_click_closes {
@@ -685,12 +1090,17 @@ impl cosmic::Application for Applet {
                 core,
                 cursor_in_applet: None,
                 desktop_cache: DesktopEntryCache::new(fde::get_languages_from_env()),
+                dragging_window: None,
                 hovered_window: None,
+                last_drag_target: None,
+                ordered_window_ids: Vec::new(),
                 pending_context_menu_window: None,
                 pending_menu_action: None,
+                pressed_window: None,
                 settings_popup: None,
                 source_windows: Vec::new(),
                 windows: Vec::new(),
+                workspace_tiling_enabled: false,
             },
             app::Task::none(),
         )
@@ -722,6 +1132,7 @@ impl cosmic::Application for Applet {
             Message::ClearHoveredWindowGlobal => {
                 self.hovered_window = None;
                 self.cursor_in_applet = None;
+                self.clear_pointer_state();
             }
             Message::CloseWindow(handle) => {
                 return self.queue_or_run_menu_action(DeferredMenuAction::WindowControl(
@@ -729,10 +1140,17 @@ impl cosmic::Application for Applet {
                 ));
             }
             Message::DesktopActionFinished => {}
-            Message::FocusWindow(handle) => {
-                focus_window(handle);
-            }
             Message::HoverWindow(handle) => {
+                if !self.workspace_tiling_enabled {
+                    if let Some(dragged_id) = self.dragging_window {
+                        let target_id = Self::window_id(&handle);
+                        if dragged_id != target_id && self.last_drag_target != Some(target_id) {
+                            let _ = self.reorder_window(dragged_id, target_id);
+                            self.last_drag_target = Some(target_id);
+                        }
+                    }
+                }
+
                 self.hovered_window = Some(handle);
             }
             Message::MinimizeWindow(handle) => {
@@ -744,6 +1162,8 @@ impl cosmic::Application for Applet {
                 if self.settings_popup.is_some() {
                     return app::Task::none();
                 }
+
+                self.clear_pointer_state();
 
                 if let Some(id) = self.context_menu_popup {
                     self.pending_context_menu_window = Some(handle);
@@ -765,6 +1185,15 @@ impl cosmic::Application for Applet {
                 return self
                     .queue_or_run_menu_action(DeferredMenuAction::LaunchDesktopAction(action));
             }
+            Message::PressWindow(handle) => {
+                self.hovered_window = Some(handle.clone());
+                self.pressed_window = Some(PressedWindow {
+                    handle,
+                    origin: self.cursor_in_applet,
+                });
+                self.dragging_window = None;
+                self.last_drag_target = None;
+            }
             Message::PopupClosed(id) => {
                 if self.context_menu_popup == Some(id) {
                     self.context_menu_popup = None;
@@ -783,6 +1212,25 @@ impl cosmic::Application for Applet {
                     self.settings_popup = None;
                     self.persist_config_if_dirty();
                 }
+            }
+            Message::ReleasePointer => {
+                if self.dragging_window.is_none() {
+                    if let Some(pressed) = self.pressed_window.take() {
+                        let pressed_id = Self::window_id(&pressed.handle);
+                        let released_over_same_window = self
+                            .hovered_window
+                            .as_ref()
+                            .is_some_and(|hovered| Self::window_id(hovered) == pressed_id);
+
+                        if released_over_same_window {
+                            focus_window(pressed.handle);
+                        }
+                    }
+                }
+
+                self.dragging_window = None;
+                self.last_drag_target = None;
+                self.pressed_window = None;
             }
             Message::SetMaxTitleChars(value) => {
                 let value = value.clamp(MIN_TITLE_CHARS, MAX_TITLE_CHARS);
@@ -811,9 +1259,27 @@ impl cosmic::Application for Applet {
             }
             Message::UpdateAppletCursor(position) => {
                 self.cursor_in_applet = Some(position);
+
+                if !self.workspace_tiling_enabled {
+                    if let Some(pressed) = self.pressed_window.as_mut() {
+                        let origin = pressed.origin.get_or_insert(position);
+
+                        if self.dragging_window.is_none()
+                            && position.distance(*origin) >= DRAG_THRESHOLD
+                        {
+                            let dragged_id = Self::window_id(&pressed.handle);
+                            self.dragging_window = Some(dragged_id);
+                            self.last_drag_target = Some(dragged_id);
+                        }
+                    }
+                }
             }
             Message::Wayland(update) => match update {
-                WaylandUpdate::WorkspaceWindows(windows) => {
+                WaylandUpdate::WorkspaceWindows {
+                    windows,
+                    tiling_enabled,
+                } => {
+                    self.workspace_tiling_enabled = tiling_enabled;
                     self.source_windows = windows;
                     self.rebuild_windows();
                 }
@@ -830,6 +1296,9 @@ impl cosmic::Application for Applet {
         Subscription::batch([
             workspace_windows_subscription().map(Message::Wayland),
             event::listen_with(|event, _, _| match event {
+                iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    Some(Message::ReleasePointer)
+                }
                 iced::Event::Mouse(mouse::Event::CursorLeft) => {
                     Some(Message::ClearHoveredWindowGlobal)
                 }
