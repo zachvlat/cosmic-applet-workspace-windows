@@ -8,13 +8,13 @@ use std::sync::LazyLock;
 use config::{AppletConfig, MAX_TITLE_CHARS, MIN_TITLE_CHARS};
 use cosmic::{
     cctk::wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
-    Element, app,
+    Apply, Element, app,
     desktop::{
         DesktopEntryCache, DesktopLookupContext, DesktopResolveOptions, IconSourceExt, fde,
-        resolve_desktop_entry,
+        resolve_desktop_entry, spawn_desktop_exec,
     },
     iced::{
-        self, Alignment, Length, Subscription, event, mouse, widget::{row, space, stack},
+        self, Alignment, Length, Subscription, event, mouse, widget::{row, space},
         window,
     },
     surface::action::{app_popup, destroy_popup},
@@ -23,14 +23,13 @@ use cosmic::{
 };
 
 use wayland::{
-    WaylandUpdate, WorkspaceWindow, close_window, focus_window, workspace_windows_subscription,
+    WaylandUpdate, WorkspaceWindow, close_window, focus_window, minimize_window,
+    set_window_maximized, workspace_windows_subscription,
 };
 
 const APP_ID: &str = "io.github.tkilian.CosmicAppletAppTitle";
-const CLOSE_ICON_SIZE: u16 = 14;
 const EMPTY_TITLE: &str = "Desktop";
-const SETTINGS_ICON: &str = "preferences-system-symbolic";
-const CONTEXT_MENU_WIDTH: f32 = 220.0;
+const CONTEXT_MENU_WIDTH: f32 = 320.0;
 const SETTINGS_POPUP_WIDTH: f32 = 360.0;
 
 static AUTOSIZE_MAIN_ID: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("autosize-main"));
@@ -39,23 +38,50 @@ pub fn run() -> cosmic::iced::Result {
     cosmic::applet::run::<Applet>(())
 }
 
+#[derive(Debug, Clone)]
+struct WindowMenuAction {
+    app_id: Option<String>,
+    exec: String,
+    name: String,
+    terminal: bool,
+}
+
 #[derive(Clone)]
 struct DisplayWindow {
+    app_name: String,
+    menu_actions: Vec<WindowMenuAction>,
     handle: ExtForeignToplevelHandleV1,
     title: String,
     icon: Option<widget::icon::Handle>,
     is_active: bool,
+    is_maximized: bool,
+}
+
+#[derive(Debug, Clone)]
+enum WindowControlAction {
+    Close(ExtForeignToplevelHandleV1),
+    Minimize(ExtForeignToplevelHandleV1),
+    SetMaximized(ExtForeignToplevelHandleV1, bool),
+}
+
+#[derive(Debug, Clone)]
+enum DeferredMenuAction {
+    LaunchDesktopAction(WindowMenuAction),
+    OpenSettings,
+    WindowControl(WindowControlAction),
 }
 
 struct Applet {
     config: AppletConfig,
     config_dirty: bool,
     context_menu_popup: Option<window::Id>,
+    context_menu_window: Option<ExtForeignToplevelHandleV1>,
     core: cosmic::app::Core,
     cursor_in_applet: Option<iced::Point>,
     desktop_cache: DesktopEntryCache,
     hovered_window: Option<ExtForeignToplevelHandleV1>,
-    open_settings_after_menu: bool,
+    pending_context_menu_window: Option<ExtForeignToplevelHandleV1>,
+    pending_menu_action: Option<DeferredMenuAction>,
     settings_popup: Option<window::Id>,
     source_windows: Vec<WorkspaceWindow>,
     windows: Vec<DisplayWindow>,
@@ -66,15 +92,18 @@ enum Message {
     ClearHoveredWindow(ExtForeignToplevelHandleV1),
     ClearHoveredWindowGlobal,
     CloseWindow(ExtForeignToplevelHandleV1),
+    DesktopActionFinished,
     FocusWindow(ExtForeignToplevelHandleV1),
     HoverWindow(ExtForeignToplevelHandleV1),
-    OpenContextMenu,
+    MinimizeWindow(ExtForeignToplevelHandleV1),
+    OpenWindowContextMenu(ExtForeignToplevelHandleV1),
     OpenSettingsPopup,
     PopupClosed(window::Id),
+    RunWindowAction(WindowMenuAction),
     SetMaxTitleChars(usize),
     SetMiddleClickCloses(bool),
     SetShowAppIcons(bool),
-    SetShowHoverCloseButton(bool),
+    SetWindowMaximized(ExtForeignToplevelHandleV1, bool),
     UpdateAppletCursor(iced::Point),
     Wayland(WaylandUpdate),
 }
@@ -91,7 +120,7 @@ impl Applet {
         self.config.max_title_chars
     }
 
-    fn resolve_icon(&mut self, window: &WorkspaceWindow) -> Option<widget::icon::Handle> {
+    fn resolve_desktop_entry(&mut self, window: &WorkspaceWindow) -> Option<fde::DesktopEntry> {
         let app_id = window.app_id.as_deref().or(window.identifier.as_deref())?;
 
         let mut lookup = DesktopLookupContext::new(app_id).with_title(window.title.as_str());
@@ -104,22 +133,167 @@ impl Applet {
             &lookup,
             &DesktopResolveOptions::default(),
         );
-        let icon = fde::IconSource::from_unknown(entry.icon().unwrap_or(&entry.appid));
-        Some(icon.as_cosmic_icon())
+
+        Some(entry)
     }
 
-    fn close_button(
-        handle: ExtForeignToplevelHandleV1,
+    fn resolve_window(&mut self, window: &WorkspaceWindow) -> DisplayWindow {
+        let mut app_name = window
+            .app_id
+            .clone()
+            .or(window.identifier.clone())
+            .unwrap_or_else(|| window.title.clone());
+        let mut menu_actions = Vec::new();
+        let mut icon = None;
+
+        if let Some(entry) = self.resolve_desktop_entry(window) {
+            let locales = self.desktop_cache.locales();
+            let app_id = Some(entry.appid.to_string());
+            let terminal = entry.terminal();
+            let has_new_window_action = entry
+                .actions()
+                .unwrap_or_default()
+                .into_iter()
+                .any(is_new_window_action_id);
+
+            app_name = entry
+                .name(locales)
+                .unwrap_or_else(|| std::borrow::Cow::Borrowed(&entry.appid))
+                .to_string();
+            if self.config.show_app_icons {
+                let icon_source =
+                    fde::IconSource::from_unknown(entry.icon().unwrap_or(&entry.appid));
+                icon = Some(icon_source.as_cosmic_icon());
+            }
+
+            if !has_new_window_action {
+                if let Some(exec) = entry.exec() {
+                    menu_actions.push(WindowMenuAction {
+                        app_id: app_id.clone(),
+                        exec: exec.to_string(),
+                        name: String::from("New Window"),
+                        terminal,
+                    });
+                }
+            }
+
+            menu_actions.extend(entry.actions().unwrap_or_default().into_iter().filter_map(
+                |action_id| {
+                    let name = entry.action_entry_localized(action_id, "Name", locales)?;
+                    let exec = entry.action_entry(action_id, "Exec")?;
+
+                    Some(WindowMenuAction {
+                        app_id: app_id.clone(),
+                        exec: exec.to_string(),
+                        name: name.to_string(),
+                        terminal,
+                    })
+                },
+            ));
+        }
+
+        DisplayWindow {
+            app_name,
+            menu_actions,
+            handle: window.handle.clone(),
+            title: window.title.clone(),
+            icon,
+            is_active: window.is_active,
+            is_maximized: window.is_maximized,
+        }
+    }
+
+    fn selected_context_window(&self) -> Option<&DisplayWindow> {
+        let handle = self.context_menu_window.as_ref()?;
+        self.windows.iter().find(|window| &window.handle == handle)
+    }
+
+    fn context_menu_label(label: impl ToString) -> Element<'static, Message> {
+        widget::text(label.to_string())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .width(Length::Shrink)
+            .into()
+    }
+
+    fn perform_window_control(action: WindowControlAction) {
+        match action {
+            WindowControlAction::Close(handle) => close_window(handle),
+            WindowControlAction::Minimize(handle) => minimize_window(handle),
+            WindowControlAction::SetMaximized(handle, maximized) => {
+                set_window_maximized(handle, maximized);
+            }
+        }
+    }
+
+    fn run_deferred_menu_action(&mut self, action: DeferredMenuAction) -> app::Task<Message> {
+        match action {
+            DeferredMenuAction::LaunchDesktopAction(action) => {
+                Self::launch_window_action_task(action)
+            }
+            DeferredMenuAction::OpenSettings => self.open_settings_task(),
+            DeferredMenuAction::WindowControl(action) => {
+                Self::perform_window_control(action);
+                app::Task::none()
+            }
+        }
+    }
+
+    fn queue_or_run_menu_action(&mut self, action: DeferredMenuAction) -> app::Task<Message> {
+        if let Some(menu_id) = self.context_menu_popup {
+            self.pending_context_menu_window = None;
+            self.pending_menu_action = Some(action);
+            surface_task(destroy_popup(menu_id))
+        } else {
+            self.run_deferred_menu_action(action)
+        }
+    }
+
+    fn context_menu_window_control(
+        icon_name: &'static str,
+        message: Message,
         is_active: bool,
+        padding: impl Into<iced::Padding>,
     ) -> Element<'static, Message> {
-        widget::button::custom(
-            widget::icon::from_name("window-close-symbolic")
-                .size(CLOSE_ICON_SIZE)
-                .icon(),
-        )
-        .padding(4)
-        .class(close_button_class(is_active))
-        .on_press(Message::CloseWindow(handle))
+        widget::icon::from_name(icon_name)
+            .apply(widget::button::icon)
+            .padding(padding)
+            .class(theme::Button::HeaderBar)
+            .selected(is_active)
+            .icon_size(16)
+            .on_press(message)
+            .into()
+    }
+
+    fn context_menu_window_controls(window: &DisplayWindow) -> Element<'static, Message> {
+        let minimize_handle = window.handle.clone();
+        let maximize_handle = window.handle.clone();
+        let close_handle = window.handle.clone();
+
+        row![
+            Self::context_menu_window_control(
+                "window-minimize-symbolic",
+                Message::MinimizeWindow(minimize_handle),
+                window.is_active,
+                8,
+            ),
+            Self::context_menu_window_control(
+                if window.is_maximized {
+                    "window-restore-symbolic"
+                } else {
+                    "window-maximize-symbolic"
+                },
+                Message::SetWindowMaximized(maximize_handle, !window.is_maximized),
+                window.is_active,
+                8,
+            ),
+            Self::context_menu_window_control(
+                "window-close-symbolic",
+                Message::CloseWindow(close_handle),
+                window.is_active,
+                [8, 4, 8, 8],
+            ),
+        ]
+        .spacing(4)
         .into()
     }
 
@@ -127,16 +301,7 @@ impl Applet {
         let source_windows = self.source_windows.clone();
         self.windows = source_windows
             .iter()
-            .map(|window| DisplayWindow {
-                handle: window.handle.clone(),
-                title: window.title.clone(),
-                icon: if self.config.show_app_icons {
-                    self.resolve_icon(window)
-                } else {
-                    None
-                },
-                is_active: window.is_active,
-            })
+            .map(|window| self.resolve_window(window))
             .collect();
 
         if self
@@ -145,6 +310,22 @@ impl Applet {
             .is_some_and(|hovered| !self.windows.iter().any(|window| &window.handle == hovered))
         {
             self.hovered_window = None;
+        }
+
+        if self
+            .context_menu_window
+            .as_ref()
+            .is_some_and(|target| !self.windows.iter().any(|window| &window.handle == target))
+        {
+            self.context_menu_window = None;
+        }
+
+        if self
+            .pending_context_menu_window
+            .as_ref()
+            .is_some_and(|target| !self.windows.iter().any(|window| &window.handle == target))
+        {
+            self.pending_context_menu_window = None;
         }
     }
 
@@ -177,14 +358,6 @@ impl Applet {
                 widget::settings::section()
                     .title("Actions")
                     .add(
-                        widget::settings::item::builder("Hover close button")
-                            .description("Show the round close button when a tile is hovered.")
-                            .toggler(
-                                self.config.show_hover_close_button,
-                                Message::SetShowHoverCloseButton,
-                            ),
-                    )
-                    .add(
                         widget::settings::item::builder("Middle-click closes windows")
                             .description("Close a window directly by middle-clicking its tile.")
                             .toggler(
@@ -203,18 +376,95 @@ impl Applet {
     }
 
     fn context_menu_panel(&self) -> Element<'_, Message> {
-        let content = container(
-            menu::menu_button(vec![
-                widget::icon::from_name(SETTINGS_ICON)
-                    .size(16)
-                    .icon()
+        let context_window = self.selected_context_window();
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+
+        let mut title_row = row![]
+            .align_y(Alignment::Center)
+            .spacing(8)
+            .width(Length::Fill);
+        if let Some(icon) = context_window.and_then(|window| window.icon.clone()) {
+            title_row = title_row.push(
+                container(
+                    widget::icon(icon)
+                        .width(Length::Fixed(16.0))
+                        .height(Length::Fixed(16.0)),
+                )
+                .padding([0, 4]),
+            );
+        }
+
+        title_row = title_row
+            .push(Self::context_menu_label(
+                context_window
+                    .map(|window| window.app_name.as_str())
+                    .unwrap_or("Workspace Windows"),
+            ))
+            .push(space::horizontal().width(Length::Fill));
+
+        if let Some(window) = context_window {
+            title_row = title_row.push(Self::context_menu_window_controls(window));
+        }
+
+        items.push(
+            container(title_row)
+                .padding(
+                    iced::Padding::ZERO
+                        .top(2.0)
+                        .bottom(2.0)
+                        .left(8.0)
+                        .right(4.0),
+                )
+                .width(Length::Fill)
+                .into(),
+        );
+        items.push(widget::divider::horizontal::light().into());
+
+        if let Some(window) = context_window {
+            if window.menu_actions.is_empty() {
+                items.push(
+                    menu::menu_button(vec![
+                        Self::context_menu_label("No application actions"),
+                        space::horizontal().width(Length::Fill).into(),
+                    ])
                     .into(),
-                widget::text("Settings").into(),
-                space::horizontal().width(Length::Fill).into(),
-            ])
-            .on_press(Message::OpenSettingsPopup),
+                );
+            } else {
+                for action in &window.menu_actions {
+                    items.push(
+                        menu::menu_button(vec![
+                            Self::context_menu_label(action.name.clone()),
+                            space::horizontal().width(Length::Fill).into(),
+                        ])
+                        .on_press(Message::RunWindowAction(action.clone()))
+                        .into(),
+                    );
+                }
+            }
+        } else {
+            items.push(
+                menu::menu_button(vec![
+                    Self::context_menu_label("Window unavailable"),
+                    space::horizontal().width(Length::Fill).into(),
+                ])
+                .into(),
+            );
+        }
+
+        items.push(widget::divider::horizontal::light().into());
+        let settings = menu::menu_button(vec![
+            Self::context_menu_label("Workspace Windows Settings"),
+            space::horizontal().width(Length::Fill).into(),
+        ])
+        .on_press(Message::OpenSettingsPopup);
+        items.push(settings.into());
+
+        let content = container(
+            widget::column::with_children(items)
+                .width(Length::Fill)
+                .spacing(2),
         )
-        .padding([8, 0])
+        .padding([8, 4])
         .width(Length::Fixed(CONTEXT_MENU_WIDTH));
 
         self.core.applet.popup_container(content).into()
@@ -252,6 +502,20 @@ impl Applet {
                 state.context_menu_panel().map(cosmic::Action::App)
             })),
         ))
+    }
+
+    fn launch_window_action_task(action: WindowMenuAction) -> app::Task<Message> {
+        cosmic::task::future(async move {
+            spawn_desktop_exec(
+                &action.exec,
+                Vec::<(String, String)>::new(),
+                action.app_id.as_deref(),
+                action.terminal,
+            )
+            .await;
+
+            Message::DesktopActionFinished
+        })
     }
 
     fn open_settings_task(&self) -> app::Task<Message> {
@@ -310,8 +574,7 @@ impl Applet {
         let handle = window.handle.clone();
         let hover_handle = handle.clone();
         let hover_move_handle = handle.clone();
-        let hover_clear_handle = handle.clone();
-        let close_handle = handle.clone();
+        let context_handle = handle.clone();
         let preview = container(content)
             .padding([2, 8])
             .class(theme::Container::custom(move |theme| {
@@ -363,30 +626,13 @@ impl Applet {
                 }
             }));
 
-        let close_button_overlay: Element<'_, Message> =
-            if self.config.show_hover_close_button && is_hovered {
-                widget::mouse_area(
-                    row![
-                        space::horizontal().width(Length::Fill),
-                        container(Self::close_button(close_handle, is_active)).padding([0, 4])
-                    ]
-                    .align_y(Alignment::Center)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                )
-                .interaction(mouse::Interaction::Idle)
-                .on_exit(Message::ClearHoveredWindow(hover_clear_handle))
-                .into()
-            } else {
-                row![].width(Length::Fill).height(Length::Fill).into()
-            };
-
-        let tile = widget::mouse_area(stack![preview, close_button_overlay])
+        let tile = widget::mouse_area(preview)
             .interaction(mouse::Interaction::Idle)
             .on_enter(Message::HoverWindow(hover_handle))
             .on_move(move |_| Message::HoverWindow(hover_move_handle.clone()))
             .on_exit(Message::ClearHoveredWindow(handle.clone()))
-            .on_press(Message::FocusWindow(handle.clone()));
+            .on_press(Message::FocusWindow(handle.clone()))
+            .on_right_press(Message::OpenWindowContextMenu(context_handle));
 
         let tile = if self.config.middle_click_closes {
             tile.on_middle_press(Message::CloseWindow(handle.clone()))
@@ -435,11 +681,13 @@ impl cosmic::Application for Applet {
                 config,
                 config_dirty: false,
                 context_menu_popup: None,
+                context_menu_window: None,
                 core,
                 cursor_in_applet: None,
                 desktop_cache: DesktopEntryCache::new(fde::get_languages_from_env()),
                 hovered_window: None,
-                open_settings_after_menu: false,
+                pending_context_menu_window: None,
+                pending_menu_action: None,
                 settings_popup: None,
                 source_windows: Vec::new(),
                 windows: Vec::new(),
@@ -476,43 +724,59 @@ impl cosmic::Application for Applet {
                 self.cursor_in_applet = None;
             }
             Message::CloseWindow(handle) => {
-                close_window(handle);
+                return self.queue_or_run_menu_action(DeferredMenuAction::WindowControl(
+                    WindowControlAction::Close(handle),
+                ));
             }
+            Message::DesktopActionFinished => {}
             Message::FocusWindow(handle) => {
                 focus_window(handle);
             }
             Message::HoverWindow(handle) => {
                 self.hovered_window = Some(handle);
             }
-            Message::OpenContextMenu => {
-                if self.settings_popup.is_some() || self.open_settings_after_menu {
+            Message::MinimizeWindow(handle) => {
+                return self.queue_or_run_menu_action(DeferredMenuAction::WindowControl(
+                    WindowControlAction::Minimize(handle),
+                ));
+            }
+            Message::OpenWindowContextMenu(handle) => {
+                if self.settings_popup.is_some() {
                     return app::Task::none();
                 }
 
                 if let Some(id) = self.context_menu_popup {
+                    self.pending_context_menu_window = Some(handle);
+                    self.pending_menu_action = None;
                     return surface_task(destroy_popup(id));
                 }
 
+                self.context_menu_window = Some(handle);
                 return self.open_context_menu_task();
             }
             Message::OpenSettingsPopup => {
-                if self.settings_popup.is_some() || self.open_settings_after_menu {
+                if self.settings_popup.is_some() {
                     return app::Task::none();
                 }
 
-                if let Some(menu_id) = self.context_menu_popup {
-                    self.open_settings_after_menu = true;
-                    return surface_task(destroy_popup(menu_id));
-                }
-
-                return self.open_settings_task();
+                return self.queue_or_run_menu_action(DeferredMenuAction::OpenSettings);
+            }
+            Message::RunWindowAction(action) => {
+                return self
+                    .queue_or_run_menu_action(DeferredMenuAction::LaunchDesktopAction(action));
             }
             Message::PopupClosed(id) => {
                 if self.context_menu_popup == Some(id) {
                     self.context_menu_popup = None;
-                    if self.open_settings_after_menu {
-                        self.open_settings_after_menu = false;
-                        return self.open_settings_task();
+                    self.context_menu_window = None;
+
+                    if let Some(action) = self.pending_menu_action.take() {
+                        return self.run_deferred_menu_action(action);
+                    }
+
+                    if let Some(handle) = self.pending_context_menu_window.take() {
+                        self.context_menu_window = Some(handle);
+                        return self.open_context_menu_task();
                     }
                 }
                 if self.settings_popup == Some(id) {
@@ -540,11 +804,10 @@ impl cosmic::Application for Applet {
                     self.rebuild_windows();
                 }
             }
-            Message::SetShowHoverCloseButton(value) => {
-                if self.config.show_hover_close_button != value {
-                    self.config.show_hover_close_button = value;
-                    self.config_dirty = true;
-                }
+            Message::SetWindowMaximized(handle, maximized) => {
+                return self.queue_or_run_menu_action(DeferredMenuAction::WindowControl(
+                    WindowControlAction::SetMaximized(handle, maximized),
+                ));
             }
             Message::UpdateAppletCursor(position) => {
                 self.cursor_in_applet = Some(position);
@@ -595,7 +858,6 @@ impl cosmic::Application for Applet {
         widget::mouse_area(autosize::autosize(content, AUTOSIZE_MAIN_ID.clone()))
             .interaction(mouse::Interaction::Idle)
             .on_move(Message::UpdateAppletCursor)
-            .on_right_press(Message::OpenContextMenu)
             .into()
     }
 
@@ -618,6 +880,19 @@ fn surface_task(action: cosmic::surface::Action) -> app::Task<Message> {
     cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)))
 }
 
+fn is_new_window_action_id(action_id: &str) -> bool {
+    let normalized = action_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect::<String>();
+
+    matches!(
+        normalized.as_str(),
+        "new" | "newwindow" | "newemptywindow" | "newmainwindow"
+    )
+}
+
 fn truncate_title(title: &str, max_chars: usize) -> String {
     let char_count = title.chars().count();
     if char_count <= max_chars {
@@ -628,46 +903,4 @@ fn truncate_title(title: &str, max_chars: usize) -> String {
     let mut truncated = title.chars().take(keep).collect::<String>();
     truncated.push_str("...");
     truncated
-}
-
-fn close_button_class(is_active: bool) -> theme::Button {
-    theme::Button::Custom {
-        active: Box::new(move |_, theme| close_button_style(theme, is_active, 0.0)),
-        disabled: Box::new(move |theme| close_button_style(theme, is_active, 0.0)),
-        hovered: Box::new(move |_, theme| close_button_style(theme, is_active, 0.14)),
-        pressed: Box::new(move |_, theme| close_button_style(theme, is_active, 0.22)),
-    }
-}
-
-fn close_button_style(
-    theme: &cosmic::Theme,
-    is_active: bool,
-    background_alpha: f32,
-) -> widget::button::Style {
-    let cosmic = theme.cosmic();
-    let foreground = if is_active {
-        cosmic.accent_button.on.into()
-    } else {
-        cosmic.background.component.on.into()
-    };
-    let background = (background_alpha > 0.0)
-        .then(|| iced::Background::Color(with_alpha(foreground, background_alpha)));
-
-    widget::button::Style {
-        shadow_offset: iced::Vector::default(),
-        background,
-        overlay: None,
-        border_radius: cosmic.corner_radii.radius_xl.into(),
-        border_width: 0.0,
-        border_color: iced::Color::TRANSPARENT,
-        outline_width: 0.0,
-        outline_color: iced::Color::TRANSPARENT,
-        icon_color: Some(foreground),
-        text_color: Some(foreground),
-    }
-}
-
-fn with_alpha(mut color: iced::Color, alpha: f32) -> iced::Color {
-    color.a = alpha;
-    color
 }

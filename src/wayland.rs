@@ -47,12 +47,15 @@ pub struct WorkspaceWindow {
     pub app_id: Option<String>,
     pub identifier: Option<String>,
     pub is_active: bool,
+    pub is_maximized: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum WaylandRequest {
     Activate(ExtForeignToplevelHandleV1),
     Close(ExtForeignToplevelHandleV1),
+    Minimize(ExtForeignToplevelHandleV1),
+    SetMaximized(ExtForeignToplevelHandleV1, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +83,28 @@ pub fn close_window(handle: ExtForeignToplevelHandleV1) {
 
     if let Some(sender) = sender {
         let _ = sender.send(WaylandRequest::Close(handle));
+    }
+}
+
+pub fn minimize_window(handle: ExtForeignToplevelHandleV1) {
+    let sender = WAYLAND_REQUEST_TX
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+
+    if let Some(sender) = sender {
+        let _ = sender.send(WaylandRequest::Minimize(handle));
+    }
+}
+
+pub fn set_window_maximized(handle: ExtForeignToplevelHandleV1, maximized: bool) {
+    let sender = WAYLAND_REQUEST_TX
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+
+    if let Some(sender) = sender {
+        let _ = sender.send(WaylandRequest::SetMaximized(handle, maximized));
     }
 }
 
@@ -142,6 +167,9 @@ impl AppData {
             is_active: info
                 .state
                 .contains(&zcosmic_toplevel_handle_v1::State::Activated),
+            is_maximized: info
+                .state
+                .contains(&zcosmic_toplevel_handle_v1::State::Maximized),
         })
     }
 
@@ -494,6 +522,24 @@ fn wayland_event_loop(
                 if let Some(cosmic_toplevel) = state.cosmic_toplevel(&handle) {
                     if let Some(manager_state) = state.toplevel_manager_state.as_ref() {
                         manager_state.manager.close(&cosmic_toplevel);
+                    }
+                }
+            }
+            calloop::channel::Event::Msg(WaylandRequest::Minimize(handle)) => {
+                if let Some(cosmic_toplevel) = state.cosmic_toplevel(&handle) {
+                    if let Some(manager_state) = state.toplevel_manager_state.as_ref() {
+                        manager_state.manager.set_minimized(&cosmic_toplevel);
+                    }
+                }
+            }
+            calloop::channel::Event::Msg(WaylandRequest::SetMaximized(handle, maximized)) => {
+                if let Some(cosmic_toplevel) = state.cosmic_toplevel(&handle) {
+                    if let Some(manager_state) = state.toplevel_manager_state.as_ref() {
+                        if maximized {
+                            manager_state.manager.set_maximized(&cosmic_toplevel);
+                        } else {
+                            manager_state.manager.unset_maximized(&cosmic_toplevel);
+                        }
                     }
                 }
             }
