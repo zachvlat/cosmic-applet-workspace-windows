@@ -6,7 +6,6 @@ mod wayland;
 use std::{
     cmp::{Ordering, Reverse},
     collections::{HashMap, HashSet},
-    sync::LazyLock,
 };
 
 use config::{AppletConfig, MAX_TITLE_CHARS, MIN_TITLE_CHARS};
@@ -27,7 +26,7 @@ use cosmic::{
     },
     surface::action::{app_popup, destroy_popup},
     theme,
-    widget::{self, autosize, container, menu},
+    widget::{self, container, menu},
 };
 
 use wayland::{
@@ -43,8 +42,11 @@ const EDGE_ALIGNMENT_TOLERANCE: i32 = 16;
 const FLOATING_OVERLAP_RATIO: f32 = 0.18;
 const FLOATING_SMALL_AREA_RATIO: f32 = 0.72;
 const SETTINGS_POPUP_WIDTH: f32 = 360.0;
-
-static AUTOSIZE_MAIN_ID: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("autosize-main"));
+const TILE_HORIZONTAL_PADDING: f32 = 8.0;
+const TILE_INNER_SPACING: f32 = 4.0;
+const TILE_MIN_ESTIMATED_WIDTH: f32 = 32.0;
+const TILE_SPACING: f32 = 6.0;
+const OVERFLOW_POPUP_MAX_HEIGHT: f32 = 320.0;
 
 type WindowId = u32;
 
@@ -79,6 +81,27 @@ struct DisplayWindow {
     is_sticky: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WindowStripLayout {
+    start: usize,
+    end: usize,
+    leading_summary: Option<usize>,
+    trailing_summary: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OverflowSummaryMode {
+    Directional,
+    CombinedTrailing,
+    None,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OverflowSummarySide {
+    Leading,
+    Trailing,
+}
+
 #[derive(Debug, Clone)]
 enum WindowControlAction {
     Close(ExtForeignToplevelHandleV1),
@@ -88,9 +111,16 @@ enum WindowControlAction {
 
 #[derive(Debug, Clone)]
 enum DeferredMenuAction {
+    FocusWindow(ExtForeignToplevelHandleV1),
     LaunchDesktopAction(WindowMenuAction),
     OpenSettings,
     WindowControl(WindowControlAction),
+}
+
+#[derive(Debug, Clone)]
+enum PendingPopup {
+    ContextMenu(ExtForeignToplevelHandleV1),
+    OverflowMenu(OverflowSummarySide),
 }
 
 struct PressedWindow {
@@ -110,9 +140,11 @@ struct Applet {
     hovered_window: Option<ExtForeignToplevelHandleV1>,
     last_drag_target: Option<WindowId>,
     ordered_window_ids: Vec<WindowId>,
-    pending_context_menu_window: Option<ExtForeignToplevelHandleV1>,
     pending_menu_action: Option<DeferredMenuAction>,
+    pending_popup: Option<PendingPopup>,
     pressed_window: Option<PressedWindow>,
+    overflow_popup: Option<window::Id>,
+    overflow_summary_side: Option<OverflowSummarySide>,
     settings_popup: Option<window::Id>,
     source_windows: Vec<WorkspaceWindow>,
     windows: Vec<DisplayWindow>,
@@ -125,7 +157,9 @@ enum Message {
     ClearHoveredWindowGlobal,
     CloseWindow(ExtForeignToplevelHandleV1),
     DesktopActionFinished,
+    FocusWindow(ExtForeignToplevelHandleV1),
     HoverWindow(ExtForeignToplevelHandleV1),
+    OpenOverflowPopup(OverflowSummarySide),
     SetLimitTileSize(bool),
     MinimizeWindow(ExtForeignToplevelHandleV1),
     OpenWindowContextMenu(ExtForeignToplevelHandleV1),
@@ -162,8 +196,242 @@ impl Applet {
         }
     }
 
+    fn displayed_title(&self, title: &str) -> String {
+        truncate_title(title, self.max_chars())
+    }
+
     fn tag_radius(theme: &theme::Theme) -> iced::border::Radius {
         theme.cosmic().radius_xl().into()
+    }
+
+    fn estimated_char_width(icon_size: f32) -> f32 {
+        (icon_size * 0.48).max(7.0)
+    }
+
+    fn estimated_tile_width(&self, window: &DisplayWindow, icon_size: f32) -> f32 {
+        let mut width = TILE_HORIZONTAL_PADDING * 2.0 + 2.0;
+
+        if window.icon.is_some() {
+            width += icon_size + TILE_INNER_SPACING;
+        }
+
+        width += self.displayed_title(&window.title).chars().count() as f32
+            * Self::estimated_char_width(icon_size);
+
+        width.max(TILE_MIN_ESTIMATED_WIDTH)
+    }
+
+    fn estimated_summary_width(hidden_count: usize, icon_size: f32) -> f32 {
+        let label_len = format!("+{hidden_count}").chars().count() as f32;
+        (TILE_HORIZONTAL_PADDING * 2.0 + 2.0 + label_len * Self::estimated_char_width(icon_size))
+            .max(TILE_MIN_ESTIMATED_WIDTH)
+    }
+
+    fn available_strip_width(&self) -> Option<f32> {
+        if !self.core.applet.is_horizontal() {
+            return None;
+        }
+
+        let bounds = self.core.applet.suggested_bounds?;
+        if bounds.width <= 0.0 {
+            return None;
+        }
+
+        let padding = self.core.applet.suggested_padding(true).0 as f32;
+        Some((bounds.width - padding * 2.0).max(0.0))
+    }
+
+    fn summary_layout(
+        total_windows: usize,
+        start: usize,
+        end: usize,
+        summary_mode: OverflowSummaryMode,
+    ) -> WindowStripLayout {
+        let hidden_before = start;
+        let hidden_after = total_windows.saturating_sub(end + 1);
+
+        match summary_mode {
+            OverflowSummaryMode::Directional => WindowStripLayout {
+                start,
+                end,
+                leading_summary: (hidden_before > 0).then_some(hidden_before),
+                trailing_summary: (hidden_after > 0).then_some(hidden_after),
+            },
+            OverflowSummaryMode::CombinedTrailing => WindowStripLayout {
+                start,
+                end,
+                leading_summary: None,
+                trailing_summary: (hidden_before + hidden_after > 0)
+                    .then_some(hidden_before + hidden_after),
+            },
+            OverflowSummaryMode::None => WindowStripLayout {
+                start,
+                end,
+                leading_summary: None,
+                trailing_summary: None,
+            },
+        }
+    }
+
+    fn strip_layout_width(prefix_widths: &[f32], layout: WindowStripLayout, icon_size: f32) -> f32 {
+        let mut width = prefix_widths[layout.end + 1] - prefix_widths[layout.start];
+        let mut item_count = layout.end - layout.start + 1;
+
+        if let Some(hidden) = layout.leading_summary {
+            width += Self::estimated_summary_width(hidden, icon_size);
+            item_count += 1;
+        }
+
+        if let Some(hidden) = layout.trailing_summary {
+            width += Self::estimated_summary_width(hidden, icon_size);
+            item_count += 1;
+        }
+
+        width + TILE_SPACING * item_count.saturating_sub(1) as f32
+    }
+
+    fn visible_window_layout(&self, icon_size: f32) -> WindowStripLayout {
+        let total_windows = self.windows.len();
+        let full_layout = WindowStripLayout {
+            start: 0,
+            end: total_windows - 1,
+            leading_summary: None,
+            trailing_summary: None,
+        };
+
+        let Some(available_width) = self.available_strip_width() else {
+            return full_layout;
+        };
+
+        let mut prefix_widths = Vec::with_capacity(total_windows + 1);
+        prefix_widths.push(0.0);
+        for window in &self.windows {
+            prefix_widths.push(
+                prefix_widths.last().copied().unwrap_or_default()
+                    + self.estimated_tile_width(window, icon_size),
+            );
+        }
+
+        if Self::strip_layout_width(&prefix_widths, full_layout, icon_size) <= available_width + 0.5
+        {
+            return full_layout;
+        }
+
+        let active_index = self.windows.iter().position(|window| window.is_active);
+        let mut best_layout = None;
+        let mut best_score = None;
+
+        for start in 0..total_windows {
+            if active_index.is_none() && start > 0 {
+                break;
+            }
+
+            for end in start..total_windows {
+                if let Some(active) = active_index {
+                    if active < start || active > end {
+                        continue;
+                    }
+                }
+
+                for summary_mode in [
+                    OverflowSummaryMode::Directional,
+                    OverflowSummaryMode::CombinedTrailing,
+                    OverflowSummaryMode::None,
+                ] {
+                    let layout = Self::summary_layout(total_windows, start, end, summary_mode);
+                    let width = Self::strip_layout_width(&prefix_widths, layout, icon_size);
+                    if width > available_width + 0.5 {
+                        continue;
+                    }
+
+                    let visible_count = end - start + 1;
+                    let marker_count = usize::from(layout.leading_summary.is_some())
+                        + usize::from(layout.trailing_summary.is_some());
+                    let balance = active_index.map_or(0, |active| {
+                        let left = active - start;
+                        let right = end - active;
+                        left.abs_diff(right)
+                    });
+                    let hidden_count = start + total_windows - end - 1;
+                    let score = (
+                        visible_count,
+                        marker_count,
+                        Reverse(balance),
+                        Reverse(hidden_count),
+                    );
+
+                    match best_score {
+                        Some(current_best) if score <= current_best => {}
+                        _ => {
+                            best_score = Some(score);
+                            best_layout = Some(layout);
+                        }
+                    }
+                }
+            }
+        }
+
+        best_layout.unwrap_or_else(|| {
+            let focus = active_index.unwrap_or(0);
+            WindowStripLayout {
+                start: focus,
+                end: focus,
+                leading_summary: None,
+                trailing_summary: None,
+            }
+        })
+    }
+
+    fn overflow_windows_for_side(&self, side: OverflowSummarySide) -> Vec<&DisplayWindow> {
+        if self.windows.is_empty() {
+            return Vec::new();
+        }
+
+        let layout = self.visible_window_layout(self.core.applet.suggested_size(true).0 as f32);
+        let hidden_before = &self.windows[..layout.start];
+        let hidden_after = if layout.end + 1 < self.windows.len() {
+            &self.windows[layout.end + 1..]
+        } else {
+            &[]
+        };
+
+        match side {
+            OverflowSummarySide::Leading => hidden_before.iter().collect(),
+            OverflowSummarySide::Trailing => {
+                if layout.leading_summary.is_none() && layout.trailing_summary.is_some() {
+                    hidden_before.iter().chain(hidden_after.iter()).collect()
+                } else {
+                    hidden_after.iter().collect()
+                }
+            }
+        }
+    }
+
+    fn overflow_popup_windows(&self) -> Vec<&DisplayWindow> {
+        self.overflow_summary_side
+            .map(|side| self.overflow_windows_for_side(side))
+            .unwrap_or_default()
+    }
+
+    fn active_ephemeral_popup_id(&self) -> Option<window::Id> {
+        self.context_menu_popup.or(self.overflow_popup)
+    }
+
+    fn open_pending_popup(&mut self, pending: PendingPopup) -> app::Task<Message> {
+        match pending {
+            PendingPopup::ContextMenu(handle) => {
+                self.context_menu_window = Some(handle);
+                self.open_context_menu_task()
+            }
+            PendingPopup::OverflowMenu(side) => {
+                if self.overflow_windows_for_side(side).is_empty() {
+                    app::Task::none()
+                } else {
+                    self.overflow_summary_side = Some(side);
+                    self.open_overflow_popup_task()
+                }
+            }
+        }
     }
 
     fn resolve_desktop_entry(&mut self, window: &WorkspaceWindow) -> Option<fde::DesktopEntry> {
@@ -263,6 +531,40 @@ impl Applet {
             .into()
     }
 
+    fn passive_tile(&self, label: impl Into<String>) -> Element<'_, Message> {
+        container(self.core.applet.text(label.into()))
+            .padding([2, 8])
+            .class(theme::Container::custom(move |theme| {
+                let cosmic = theme.cosmic();
+                let background = cosmic.background.component.base.into();
+                let foreground = cosmic.background.component.on.into();
+
+                container::Style {
+                    icon_color: Some(foreground),
+                    text_color: Some(foreground),
+                    background: Some(iced::Background::Color(background)),
+                    border: iced::Border {
+                        radius: Self::tag_radius(theme),
+                        ..Default::default()
+                    },
+                    shadow: Default::default(),
+                    snap: true,
+                }
+            }))
+            .into()
+    }
+
+    fn overflow_tile(
+        &self,
+        hidden_count: usize,
+        side: OverflowSummarySide,
+    ) -> Element<'_, Message> {
+        widget::mouse_area(self.passive_tile(format!("+{hidden_count}")))
+            .interaction(mouse::Interaction::Idle)
+            .on_press(Message::OpenOverflowPopup(side))
+            .into()
+    }
+
     fn perform_window_control(action: WindowControlAction) {
         match action {
             WindowControlAction::Close(handle) => close_window(handle),
@@ -275,6 +577,10 @@ impl Applet {
 
     fn run_deferred_menu_action(&mut self, action: DeferredMenuAction) -> app::Task<Message> {
         match action {
+            DeferredMenuAction::FocusWindow(handle) => {
+                focus_window(handle);
+                app::Task::none()
+            }
             DeferredMenuAction::LaunchDesktopAction(action) => {
                 Self::launch_window_action_task(action)
             }
@@ -287,8 +593,8 @@ impl Applet {
     }
 
     fn queue_or_run_menu_action(&mut self, action: DeferredMenuAction) -> app::Task<Message> {
-        if let Some(menu_id) = self.context_menu_popup {
-            self.pending_context_menu_window = None;
+        if let Some(menu_id) = self.active_ephemeral_popup_id() {
+            self.pending_popup = None;
             self.pending_menu_action = Some(action);
             surface_task(destroy_popup(menu_id))
         } else {
@@ -717,11 +1023,25 @@ impl Applet {
         }
 
         if self
-            .pending_context_menu_window
-            .as_ref()
-            .is_some_and(|target| !self.windows.iter().any(|window| &window.handle == target))
+            .overflow_summary_side
+            .is_some_and(|side| self.overflow_windows_for_side(side).is_empty())
         {
-            self.pending_context_menu_window = None;
+            self.overflow_summary_side = None;
+        }
+
+        if self
+            .pending_popup
+            .as_ref()
+            .is_some_and(|pending| match pending {
+                PendingPopup::ContextMenu(target) => {
+                    !self.windows.iter().any(|window| &window.handle == target)
+                }
+                PendingPopup::OverflowMenu(side) => {
+                    self.overflow_windows_for_side(*side).is_empty()
+                }
+            })
+        {
+            self.pending_popup = None;
         }
 
         if self.pressed_window.as_ref().is_some_and(|pressed| {
@@ -884,6 +1204,83 @@ impl Applet {
         self.core.applet.popup_container(content).into()
     }
 
+    fn overflow_popup_panel(&self) -> Element<'_, Message> {
+        let hidden_windows = self.overflow_popup_windows();
+        let mut items: Vec<Element<'_, Message>> = vec![
+            container(
+                row![
+                    Self::context_menu_label(format!("Hidden windows ({})", hidden_windows.len())),
+                    space::horizontal().width(Length::Fill),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(8),
+            )
+            .padding(
+                iced::Padding::ZERO
+                    .top(2.0)
+                    .bottom(2.0)
+                    .left(8.0)
+                    .right(4.0),
+            )
+            .width(Length::Fill)
+            .into(),
+            widget::divider::horizontal::light().into(),
+        ];
+
+        if hidden_windows.is_empty() {
+            items.push(
+                menu::menu_button(vec![
+                    Self::context_menu_label("No hidden windows"),
+                    space::horizontal().width(Length::Fill).into(),
+                ])
+                .into(),
+            );
+        } else {
+            for window in hidden_windows {
+                let mut row = vec![];
+
+                if let Some(icon) = window.icon.clone() {
+                    row.push(
+                        container(
+                            widget::icon(icon)
+                                .width(Length::Fixed(16.0))
+                                .height(Length::Fixed(16.0)),
+                        )
+                        .padding([0, 4])
+                        .into(),
+                    );
+                }
+
+                let label = if window.title.trim().is_empty() {
+                    window.app_name.clone()
+                } else {
+                    self.displayed_title(&window.title)
+                };
+                row.push(Self::context_menu_label(label));
+                row.push(space::horizontal().width(Length::Fill).into());
+
+                items.push(
+                    menu::menu_button(row)
+                        .on_press(Message::FocusWindow(window.handle.clone()))
+                        .into(),
+                );
+            }
+        }
+
+        let list = widget::scrollable(
+            widget::column::with_children(items)
+                .width(Length::Fill)
+                .spacing(2),
+        );
+
+        let content = container(list)
+            .max_height(OVERFLOW_POPUP_MAX_HEIGHT)
+            .padding([8, 4])
+            .width(Length::Fixed(CONTEXT_MENU_WIDTH));
+
+        self.core.applet.popup_container(content).into()
+    }
+
     fn open_context_menu_task(&self) -> app::Task<Message> {
         surface_task(app_popup::<Applet>(
             |state: &mut Applet| {
@@ -914,6 +1311,40 @@ impl Applet {
             },
             Some(Box::new(|state: &Applet| {
                 state.context_menu_panel().map(cosmic::Action::App)
+            })),
+        ))
+    }
+
+    fn open_overflow_popup_task(&self) -> app::Task<Message> {
+        surface_task(app_popup::<Applet>(
+            |state: &mut Applet| {
+                let new_id = window::Id::unique();
+                state.overflow_popup = Some(new_id);
+
+                let mut popup_settings = state.core.applet.get_popup_settings(
+                    state
+                        .core
+                        .main_window_id()
+                        .expect("applet main window missing"),
+                    new_id,
+                    None,
+                    None,
+                    None,
+                );
+
+                if let Some(position) = state.cursor_in_applet {
+                    popup_settings.positioner.anchor_rect = iced::Rectangle {
+                        x: position.x.round() as i32,
+                        y: position.y.round() as i32,
+                        width: 1,
+                        height: 1,
+                    };
+                }
+
+                popup_settings
+            },
+            Some(Box::new(|state: &Applet| {
+                state.overflow_popup_panel().map(cosmic::Action::App)
             })),
         ))
     }
@@ -967,8 +1398,10 @@ impl Applet {
     }
 
     fn window_tile(&self, window: &DisplayWindow, icon_size: f32) -> Element<'_, Message> {
-        let text = truncate_title(&window.title, self.max_chars());
-        let mut content = row![].align_y(Alignment::Center).spacing(4);
+        let text = self.displayed_title(&window.title);
+        let mut content = row![]
+            .align_y(Alignment::Center)
+            .spacing(TILE_INNER_SPACING);
 
         if let Some(icon) = window.icon.clone() {
             content = content.push(
@@ -1067,26 +1500,7 @@ impl Applet {
     }
 
     fn empty_tile(&self) -> Element<'_, Message> {
-        container(self.core.applet.text(EMPTY_TITLE))
-            .padding([2, 8])
-            .class(theme::Container::custom(move |theme| {
-                let cosmic = theme.cosmic();
-                let background = cosmic.background.component.base.into();
-                let foreground = cosmic.background.component.on.into();
-
-                container::Style {
-                    icon_color: Some(foreground),
-                    text_color: Some(foreground),
-                    background: Some(iced::Background::Color(background)),
-                    border: iced::Border {
-                        radius: Self::tag_radius(theme),
-                        ..Default::default()
-                    },
-                    shadow: Default::default(),
-                    snap: true,
-                }
-            }))
-            .into()
+        self.passive_tile(EMPTY_TITLE)
     }
 }
 
@@ -1112,9 +1526,11 @@ impl cosmic::Application for Applet {
                 hovered_window: None,
                 last_drag_target: None,
                 ordered_window_ids: Vec::new(),
-                pending_context_menu_window: None,
                 pending_menu_action: None,
+                pending_popup: None,
                 pressed_window: None,
+                overflow_popup: None,
+                overflow_summary_side: None,
                 settings_popup: None,
                 source_windows: Vec::new(),
                 windows: Vec::new(),
@@ -1158,6 +1574,9 @@ impl cosmic::Application for Applet {
                 ));
             }
             Message::DesktopActionFinished => {}
+            Message::FocusWindow(handle) => {
+                return self.queue_or_run_menu_action(DeferredMenuAction::FocusWindow(handle));
+            }
             Message::HoverWindow(handle) => {
                 if !self.workspace_tiling_enabled {
                     if let Some(dragged_id) = self.dragging_window {
@@ -1182,6 +1601,23 @@ impl cosmic::Application for Applet {
                     WindowControlAction::Minimize(handle),
                 ));
             }
+            Message::OpenOverflowPopup(side) => {
+                if self.settings_popup.is_some() || self.overflow_windows_for_side(side).is_empty()
+                {
+                    return app::Task::none();
+                }
+
+                self.clear_pointer_state();
+
+                if let Some(id) = self.active_ephemeral_popup_id() {
+                    self.pending_popup = Some(PendingPopup::OverflowMenu(side));
+                    self.pending_menu_action = None;
+                    return surface_task(destroy_popup(id));
+                }
+
+                self.overflow_summary_side = Some(side);
+                return self.open_overflow_popup_task();
+            }
             Message::OpenWindowContextMenu(handle) => {
                 if self.settings_popup.is_some() {
                     return app::Task::none();
@@ -1189,8 +1625,8 @@ impl cosmic::Application for Applet {
 
                 self.clear_pointer_state();
 
-                if let Some(id) = self.context_menu_popup {
-                    self.pending_context_menu_window = Some(handle);
+                if let Some(id) = self.active_ephemeral_popup_id() {
+                    self.pending_popup = Some(PendingPopup::ContextMenu(handle));
                     self.pending_menu_action = None;
                     return surface_task(destroy_popup(id));
                 }
@@ -1222,19 +1658,22 @@ impl cosmic::Application for Applet {
                 if self.context_menu_popup == Some(id) {
                     self.context_menu_popup = None;
                     self.context_menu_window = None;
-
-                    if let Some(action) = self.pending_menu_action.take() {
-                        return self.run_deferred_menu_action(action);
-                    }
-
-                    if let Some(handle) = self.pending_context_menu_window.take() {
-                        self.context_menu_window = Some(handle);
-                        return self.open_context_menu_task();
-                    }
+                }
+                if self.overflow_popup == Some(id) {
+                    self.overflow_popup = None;
+                    self.overflow_summary_side = None;
                 }
                 if self.settings_popup == Some(id) {
                     self.settings_popup = None;
                     self.persist_config_if_dirty();
+                }
+
+                if let Some(action) = self.pending_menu_action.take() {
+                    return self.run_deferred_menu_action(action);
+                }
+
+                if let Some(pending) = self.pending_popup.take() {
+                    return self.open_pending_popup(pending);
                 }
             }
             Message::ReleasePointer => {
@@ -1335,20 +1774,37 @@ impl cosmic::Application for Applet {
         let height = (self.core.applet.suggested_size(true).1
             + 2 * self.core.applet.suggested_padding(true).1) as f32;
         let icon_size = self.core.applet.suggested_size(true).0 as f32;
-        let mut content = row![].align_y(Alignment::Center).spacing(6);
+        let mut content = row![]
+            .align_y(Alignment::Center)
+            .spacing(TILE_SPACING)
+            .clip(true);
 
         if self.windows.is_empty() {
             content = content.push(self.empty_tile());
         } else {
-            for window in &self.windows {
+            let layout = self.visible_window_layout(icon_size);
+
+            if let Some(hidden_count) = layout.leading_summary {
+                content =
+                    content.push(self.overflow_tile(hidden_count, OverflowSummarySide::Leading));
+            }
+
+            for window in &self.windows[layout.start..=layout.end] {
                 content = content.push(self.window_tile(window, icon_size));
+            }
+
+            if let Some(hidden_count) = layout.trailing_summary {
+                content =
+                    content.push(self.overflow_tile(hidden_count, OverflowSummarySide::Trailing));
             }
         }
 
         content = content.push(space::vertical().height(Length::Fixed(height)));
 
-        let content = container(content).padding([0, self.core.applet.suggested_padding(true).0]);
-        widget::mouse_area(autosize::autosize(content, AUTOSIZE_MAIN_ID.clone()))
+        let content = container(content)
+            .padding([0, self.core.applet.suggested_padding(true).0])
+            .clip(true);
+        widget::mouse_area(self.core.applet.autosize_window(content))
             .interaction(mouse::Interaction::Idle)
             .on_move(Message::UpdateAppletCursor)
             .into()
@@ -1359,6 +1815,8 @@ impl cosmic::Application for Applet {
             self.settings_panel()
         } else if self.context_menu_popup == Some(id) {
             self.context_menu_panel()
+        } else if self.overflow_popup == Some(id) {
+            self.overflow_popup_panel()
         } else {
             widget::text::body("").into()
         }
