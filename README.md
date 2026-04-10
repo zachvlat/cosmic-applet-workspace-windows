@@ -30,7 +30,7 @@ just install
 Then restart the panel:
 
 ```bash
-pkill -x cosmic-panel
+./scripts/restart-panel.sh
 ```
 
 Or:

@@ -10,7 +10,7 @@ install: build
     ./scripts/install-local.sh
 
 restart-panel:
-    pkill -x cosmic-panel
+    ./scripts/restart-panel.sh
 
 install-restart: install
-    pkill -x cosmic-panel
+    ./scripts/restart-panel.sh
