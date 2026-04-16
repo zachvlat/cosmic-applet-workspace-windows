@@ -1,0 +1,51 @@
+{
+  "app-id": "io.github.tkilian.CosmicAppletWorkspaceWindows",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "24.08",
+  "sdk": "org.freedesktop.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
+  "command": "cosmic-applet-workspace-windows",
+  "finish-args": [
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=pulseaudio",
+    "--device=dri",
+    "--share=network",
+    "--filesystem=xdg-config:ro",
+    "--filesystem=xdg-data:ro",
+    "--filesystem=xdg-config:rw",
+    "--talk-name=org.freedesktop.Notifications",
+    "--own-name=io.github.tkilian.*",
+    "--env=XDG_CURRENT_DESKTOP=cosmic",
+    "--env=COSMIC_PANEL_OUTPUT=",
+    "--env=http_proxy=",
+    "--env=https_proxy="
+  ],
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/cosmic-applet-workspace-windows/cargo",
+      "RUST_BACKTRACE": "1"
+    }
+  },
+  "modules": [
+    {
+      "name": "cosmic-applet-workspace-windows",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo build --release --offline --locked",
+        "install -Dm755 target/release/cosmic-applet-workspace-windows /app/bin/cosmic-applet-workspace-windows",
+        "install -Dm644 data/io.github.tkilian.CosmicAppletWorkspaceWindows.desktop /app/share/applications/io.github.tkilian.CosmicAppletWorkspaceWindows.desktop",
+        "install -Dm644 data/icons/scalable/apps/io.github.tkilian.CosmicAppletWorkspaceWindows.svg /app/share/icons/hicolor/scalable/apps/io.github.tkilian.CosmicAppletWorkspaceWindows.svg"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "."
+        }
+      ]
+    }
+  ]
+}
